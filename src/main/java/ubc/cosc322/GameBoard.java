@@ -3,12 +3,12 @@ package ubc.cosc322;
 import java.util.*;
 
 /*
-Central board representation for the Game of Amazons.
-
-Internally uses a flat int[100] (0-indexed, row/col are 1-based externally).
-Exposes a 2D view via getBoard2D() for GUI/legacy code.
-
-Piece values: 0=EMPTY  1=BLACK  2=WHITE  3=ARROW
+ * Central board representation for the Game of Amazons.
+ *
+ * Internally uses a flat int[100] (0-indexed, row/col are 1-based externally).
+ * Exposes a 2D view via getBoard2D() for GUI/legacy code.
+ *
+ * Piece values: 0=EMPTY  1=BLACK  2=WHITE  3=ARROW
  */
 
 public class GameBoard {
@@ -22,6 +22,18 @@ public class GameBoard {
 
     // Flat 1D board
     private int[] board = new int[SIZE * SIZE];
+
+    // Zobrist hash table: ZOBRIST[piece][cell] where piece in {1,2,3} (BLACK/WHITE/ARROW).
+    // Initialised once statically so all boards share the same random values.
+    // XOR-ing these values produces a unique hash for each board state, used by
+    // the MCTS transposition table to detect repeated positions across the tree.
+    private static final long[][] ZOBRIST = new long[4][SIZE * SIZE];
+    static {
+        Random rng = new Random(0x322A4A207A6F4272L);
+        for (int p = 1; p <= 3; p++)
+            for (int i = 0; i < SIZE * SIZE; i++)
+                ZOBRIST[p][i] = rng.nextLong();
+    }
 
     // Indexing helpers from 2D -> 1D and vice versa
     public static int flat(int r, int c)         { return (r - 1) * SIZE + (c - 1); }
@@ -73,6 +85,49 @@ public class GameBoard {
         next.board[flat(m[2], m[3])] = piece;
         next.board[flat(m[4], m[5])] = ARROW;
         return next;
+    }
+
+    // Applies a packed move in-place and returns the displaced values so the
+    // move can be undone with undoPackedMove — avoids allocating a board copy.
+    // Returns int[]{piece, prevTo, prevArrow} for the undo call.
+    // Use this pattern for short-lived evaluations (heuristics, pruning checks)
+    // where you need the board state temporarily but don't want to keep the copy.
+    public int[] applyTempMove(int[] m) {
+        int piece    = board[flat(m[0], m[1])];
+        int prevTo   = board[flat(m[2], m[3])];
+        int prevArrow = board[flat(m[4], m[5])];
+        board[flat(m[0], m[1])] = EMPTY;
+        board[flat(m[2], m[3])] = piece;
+        board[flat(m[4], m[5])] = ARROW;
+        return new int[]{piece, prevTo, prevArrow};
+    }
+
+    // Undoes a move applied by applyTempMove, restoring the board to its prior state.
+    // undo must be the int[] returned by the matching applyTempMove call.
+    public void undoTempMove(int[] m, int[] undo) {
+        board[flat(m[0], m[1])] = undo[0]; // restore piece to source
+        board[flat(m[2], m[3])] = undo[1]; // restore destination
+        board[flat(m[4], m[5])] = undo[2]; // restore arrow square
+    }
+
+    // Incrementally updates a Zobrist hash for a packed move without recomputing
+    // from scratch. XORs out old cell values and XORs in new ones for the 3
+    // affected cells — O(1) vs O(100) for a full recompute.
+    // undo is the int[] returned by applyTempMove for the same move.
+    // XOR is symmetric so the same call works for both apply and undo directions.
+    public static long updateHash(long hash, int[] m, int[] undo) {
+        int fromIdx  = flat(m[0], m[1]);
+        int toIdx    = flat(m[2], m[3]);
+        int arrowIdx = flat(m[4], m[5]);
+        int piece    = undo[0]; // the moving piece
+        // XOR out old state of the 3 cells
+        if (piece   != EMPTY) hash ^= ZOBRIST[piece][fromIdx];    // piece was at source
+        if (undo[1] != EMPTY) hash ^= ZOBRIST[undo[1]][toIdx];    // whatever was at dest
+        if (undo[2] != EMPTY) hash ^= ZOBRIST[undo[2]][arrowIdx]; // whatever was at arrow
+        // XOR in new state (source is now EMPTY so nothing to XOR there)
+        if (piece   != EMPTY) hash ^= ZOBRIST[piece][toIdx];      // piece moved to dest
+        hash ^= ZOBRIST[ARROW][arrowIdx];                          // arrow placed
+        return hash;
     }
 
     // Helper for generating legal moves — operates on a local board copy so
@@ -163,10 +218,56 @@ public class GameBoard {
         return mine - theirs;
     }
 
+    // W2 reachability: marks every empty cell a color can reach in exactly one
+    // queen slide from any of its queens. Returns a boolean array where true
+    // means the color can reach that cell without moving through occupied squares.
+    // Unlike W1 (minimum moves), W2 captures *immediate* threats — if your queen
+    // can slide to a cell in one move, you own it tactically right now.
+    public boolean[] w2Reach(int color) {
+        boolean[] reach = new boolean[SIZE * SIZE];
+        for (int i = 0; i < SIZE * SIZE; i++) {
+            if (board[i] != color) continue;
+            int r = row(i), c = col(i);
+            // Slide in all 8 directions, marking every empty cell reachable
+            for (int d = 0; d < 8; d++) {
+                int nr = r + DR[d], nc = c + DC[d];
+                while (inBounds(nr, nc) && board[flat(nr, nc)] == EMPTY) {
+                    reach[flat(nr, nc)] = true;
+                    nr += DR[d]; nc += DC[d];
+                }
+            }
+        }
+        return reach;
+    }
+
+    // W2 territory difference: (cells only we can reach in 1 move)
+    //                        - (cells only opponent can reach in 1 move).
+    // Contested cells (both can reach) count as 0 — neither side owns them yet.
+    // This is much more tactically accurate than W1 for early/midgame positions
+    // because it directly measures who controls each cell *right now*.
+    public double territoryDiffW2(int color) {
+        int      opp   = (color == BLACK) ? WHITE : BLACK;
+        boolean[] mine  = w2Reach(color);
+        boolean[] theirs = w2Reach(opp);
+        double myCount = 0, oppCount = 0;
+        for (int i = 0; i < SIZE * SIZE; i++) {
+            if (board[i] != EMPTY) continue;
+            if      ( mine[i] && !theirs[i]) myCount++;
+            else if (!mine[i] &&  theirs[i]) oppCount++;
+        }
+        return myCount - oppCount;
+    }
+
     // Scalar board evaluation in [0,1] for use in MCTS backprop.
     // Returns > 0.5 when 'myColor' is winning territorially.
     public double eval(int myColor) {
         return 0.5 + territoryDiff(myColor) / (2.0 * SIZE * SIZE);
+    }
+
+    // W2-based eval: uses immediate reachability instead of W1 distance.
+    // More accurate for early/midgame where tactical threats matter most.
+    public double evalW2(int myColor) {
+        return 0.5 + territoryDiffW2(myColor) / (2.0 * SIZE * SIZE);
     }
 
     // Validity check
@@ -197,6 +298,16 @@ public class GameBoard {
         GameBoard gb = new GameBoard();
         gb.board = this.board.clone();
         return gb;
+    }
+
+    // Computes the Zobrist hash of the current board state.
+    // Each piece on each cell XORs in a pre-generated random value so the
+    // hash changes predictably with each move — used by the transposition table.
+    public long zobristHash() {
+        long h = 0L;
+        for (int i = 0; i < SIZE * SIZE; i++)
+            if (board[i] != EMPTY) h ^= ZOBRIST[board[i]][i];
+        return h;
     }
 
     public void printBoard() {
