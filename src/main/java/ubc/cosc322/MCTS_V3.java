@@ -9,32 +9,8 @@ import ygraph.ai.smartfox.games.amazons.AmazonsGameMessage;
 
 import java.util.*;
 
-/*
-COSC322 Amazons Bot — Monte Carlo Tree Search V3
 
-Changes over V2 (all justified by iteration count vs quality tradeoff):
-
-1. Bug fix: UCT constant was 1.2 in V2's select() — changed to 1.41 (sqrt(2)).
-
-2. Shared Random field — no new Random() per simulate() call.
-
-3. orderMoves() uses parent BFS arrays as proxy (zero board clones).
-   V2: ~200 clones + ~400 BFS calls per sort. V3: 2 BFS calls total (cached).
-
-4. pickMoveLate() uses applyTempMove/undo — no board clone per sample.
-
-5. Rollout depth scales with phase:
-   Early game: 60 steps (was 30). Deeper rollouts reach more decisive positions,
-   reducing noise and giving MCTS a clearer win/loss signal to learn from.
-   Late game: stays at 30 (board is fragmented, positions resolve faster).
-
-6. Greedy terminal check: if a player has <= 1 move, treat it as near-terminal
-   and return eval immediately rather than burning rollout steps on a dead end.
-
-7. Early game rollout uses 100% heuristic (was 80%). The 20% random noise
-   was hurting signal quality — deterministic greedy rollouts are stronger
-   here since the heuristic is reliable in open positions.
-*/
+//COSC322 Amazons Bot — Monte Carlo Tree Search V3
 
 public class MCTS_V3 extends GamePlayer {
 
@@ -138,8 +114,6 @@ public class MCTS_V3 extends GamePlayer {
 		return count;
 	}
 
-	// ── MCTS ──────────────────────────────────────────────────────────────────
-
 	private void makeMCTSMove() {
 		int arrows    = countArrows(board);
 		boolean early = arrows < LATE_THRESHOLD;
@@ -159,8 +133,6 @@ public class MCTS_V3 extends GamePlayer {
 
 		if (gamegui != null) gamegui.updateGameState(buildMoveMap(best));
 	}
-
-	// ── Node ──────────────────────────────────────────────────────────────────
 
 	private static class Node {
 		int[]       move;
@@ -188,7 +160,6 @@ public class MCTS_V3 extends GamePlayer {
 		}
 	}
 
-	// ── Core MCTS ─────────────────────────────────────────────────────────────
 
 	private int[] mcts(GameBoard rootBoard, int rootColor, boolean earlyGame) {
 		List<int[]> rootMoves = rootBoard.generateMoves(rootColor);
@@ -215,7 +186,6 @@ public class MCTS_V3 extends GamePlayer {
 	}
 
 	private Node select(Node node, boolean earlyGame) {
-		// Fix: 1.41 not 1.2 — V2 had this wrong
 		while (node.untried != null && node.untried.isEmpty() && !node.children.isEmpty())
 			node = node.children.stream()
 					.max(Comparator.comparingDouble(n -> n.uct(1.41, earlyGame)))
@@ -260,7 +230,7 @@ public class MCTS_V3 extends GamePlayer {
 		return b.eval(myColor);
 	}
 
-	// Early game: 100% greedy heuristic (removed 20% random — noise hurts signal)
+	// Early game
 	private int[] pickMoveEarly(GameBoard b, List<int[]> moves, int color) {
 		int[]  best   = null;
 		double bs     = Double.NEGATIVE_INFINITY;
@@ -273,7 +243,7 @@ public class MCTS_V3 extends GamePlayer {
 		return best != null ? best : moves.get(rng.nextInt(moves.size()));
 	}
 
-	// Late game: applyTempMove/undo — no board clone per sample
+	// Late game
 	private int[] pickMoveLate(GameBoard b, List<int[]> moves, int color) {
 		if (rng.nextDouble() < 0.8) {
 			int[]  best   = null;
@@ -308,11 +278,6 @@ public class MCTS_V3 extends GamePlayer {
 		return total;
 	}
 
-	/*
-	orderMoves: parent BFS arrays as proxy — zero clones, O(1) per move.
-	Score = -(how far we are from the destination) + (how far opponent is).
-	Both arrays are cached on board b after the first territoryDiff() call.
-	*/
 	private List<int[]> orderMoves(GameBoard b, List<int[]> moves, int color) {
 		int   opp     = opp(color);
 		int[] myDist  = b.bfsDist(color);
@@ -339,8 +304,6 @@ public class MCTS_V3 extends GamePlayer {
 	}
 
 	private int opp(int c) { return c == BLACK ? WHITE : BLACK; }
-
-	// ── Networking ────────────────────────────────────────────────────────────
 
 	private void sendMove(int[] m) { gameClient.sendMoveMessage(buildMoveMap(m)); }
 
